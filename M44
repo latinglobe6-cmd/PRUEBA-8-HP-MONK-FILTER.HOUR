@@ -1,0 +1,427 @@
+#property copyright ""
+#property link "" 
+#property strict
+#property version "3.01"
+
+enum manager {
+   P=0, // Primary
+   B=1, // Secondary
+}; 
+
+extern manager TradeManager = 0;
+extern string TradeComment = "M"; 
+extern int MagicNumber = 33431; 
+extern int Slippage = 3;
+extern int MaxSpread = 18;
+extern double FixedLot = 0;
+extern int RiskPercent = 30; 
+extern int MaxDrawdown = 90;
+extern int TradeDeviation = 3;  
+extern int TradeDelta = 12;
+extern int Stoploss = 12;   // Stoploss en puntos
+extern int StartHour = 1;
+extern int StartMinute = 0;
+extern int EndHour = 23;
+extern int EndMinute = 0;
+extern int GMTOffset = 0; // GMTOffset (0 = Disabled)
+extern int Trailing = 3;  
+extern int TrailingLoss = 7;  
+extern int VelocityTrigger = 70;
+extern int VelocityStop = 40; 
+extern int VelocityTime = 7;  
+int DeleteRatio = 30;  
+extern int FastTick = 30;
+extern int SlowTick = 100; 
+int OrderExpiry = 15; 
+int TickSample = 100;  
+int r, gmt, brokerOffset, size, digits, stoplevel;
+
+double marginRequirement, maxLot, minLot, lotSize, points, currentSpread, avgSpread, maxSpread, initialBalance, rateChange, rateTrigger, deleteRatio, commissionPoints;
+
+double spreadSize[]; 
+double tick[];
+double avgtick[];
+int tickTime[];   
+
+string testerStartDate, testerEndDate; 
+
+int lastBuyOrder, lastSellOrder;
+
+bool calculateCommission = true;
+
+double max = 0;
+
+double tickBidFast[];
+int tickTimeBidFast[];   
+
+double tickAskFast[];
+int tickTimeAskFast[];  
+
+double tickBidSlow[];
+int tickTimeBidSlow[];  
+
+double tickAskSlow[];
+int tickTimeAskSlow[];  
+
+int sizeFast;
+int sizeSlow; 
+
+int maxValueIdx, minValueIdx, maxValueIdxSlow, minValueIdxSlow;
+
+double fastSize, slowSize, avgFast, avgSlow, volatilityRatio, directionRatio;
+int totalTickCount;
+int init() {   
+   marginRequirement = MarketInfo( Symbol(), MODE_MARGINREQUIRED ) * 0.01;
+   maxLot = ( double ) MarketInfo( Symbol(), MODE_MAXLOT );  
+   minLot = ( double ) MarketInfo( Symbol(), MODE_MINLOT );  
+   currentSpread = NormalizeDouble( Ask - Bid, Digits ); 
+   stoplevel = ( int ) MathMax( MarketInfo( Symbol(), MODE_FREEZELEVEL ), MarketInfo( Symbol(), MODE_STOPLEVEL ) );
+   if( stoplevel > TradeDelta ) TradeDelta = stoplevel;
+   if( stoplevel > Trailing ) Trailing = stoplevel;
+   avgSpread = currentSpread; 
+   size = TickSample;
+   ArrayResize( spreadSize, size ); 
+   ArrayFill( spreadSize, 0, size, avgSpread );
+   maxSpread = NormalizeDouble( MaxSpread * Point, Digits );
+   deleteRatio = NormalizeDouble( ( double ) DeleteRatio / 100, 2 );
+   rateTrigger = NormalizeDouble( ( double ) VelocityTrigger * Point, Digits );
+   testerStartDate = StringConcatenate( Year(), "-", Month(), "-", Day() );
+   initialBalance = AccountBalance();  
+   display();
+   totalTickCount = 0;
+   sizeFast = FastTick;
+   sizeSlow = SlowTick;
+   ObjectCreate(0,"max",OBJ_HLINE,0,0,0);
+   ObjectCreate(0,"min",OBJ_HLINE,0,0,0);
+   ObjectCreate(0,"maxSlow",OBJ_HLINE,0,0,0);
+   ObjectCreate(0,"minSlow",OBJ_HLINE,0,0,0);
+   ObjectCreate(0,"buyStopPrice",OBJ_HLINE,0,0,0);
+   ObjectCreate(0,"sellStopPrice",OBJ_HLINE,0,0,0);
+   ObjectSet( "max", OBJPROP_COLOR, clrWhite );
+   ObjectSet( "min", OBJPROP_COLOR, clrWhite );
+   ObjectSet( "maxSlow", OBJPROP_COLOR, clrDarkKhaki );
+   ObjectSet( "minSlow", OBJPROP_COLOR, clrDarkKhaki );
+   
+   ObjectSet( "buyStopPrice", OBJPROP_COLOR, clrGreen );
+   ObjectSet( "sellStopPrice", OBJPROP_COLOR, clrRed );
+   
+   ObjectCreate(0,"buyEntryPrice",OBJ_HLINE,0,0,0);
+   ObjectCreate(0,"sellEntryPrice",OBJ_HLINE,0,0,0);
+   
+   ObjectSet( "buyEntryPrice", OBJPROP_COLOR, clrGreen );
+   ObjectSet( "sellEntryPrice", OBJPROP_COLOR, clrRed );
+   
+   return ( 0 );
+} 
+
+void commission(){ 
+   if( !IsTesting() ){ 
+      double rate = 0;
+      for( int pos = OrdersHistoryTotal() - 1; pos >= 0; pos-- ) {
+         if( OrderSelect( pos, SELECT_BY_POS, MODE_HISTORY ) ) {
+            if( OrderProfit() != 0.0 ) {
+               if( OrderClosePrice() != OrderOpenPrice() ) {
+                  if( OrderSymbol() == Symbol() ) {
+                     calculateCommission = false;
+                     rate = MathAbs( OrderProfit() / MathAbs( OrderClosePrice() - OrderOpenPrice() ) );
+                     commissionPoints = ( -OrderCommission() ) / rate;
+                     break;
+                  }
+               }
+            }
+         }
+      } 
+   }
+}
+
+int start() {   
+   int totalBuyStop = 0;
+   int totalSellStop = 0;  
+   int totalTrades = 0;
+   int ticket;  
+   if( calculateCommission ) commission();
+   prepareSpread();
+   manageTicks();  
+   manageTicks2();
+   for( int pos = 0; pos < OrdersTotal(); pos++ ) {
+      r = OrderSelect( pos, SELECT_BY_POS, MODE_TRADES );
+      if( OrderSymbol() != Symbol() ) continue;   
+      if( OrderMagicNumber() == MagicNumber ){ 
+         totalTrades++;
+         switch ( OrderType() ) {
+            case OP_BUYSTOP:
+               if( ( int ) TimeCurrent() - lastBuyOrder > VelocityTime && rateChange < VelocityTrigger * Point * deleteRatio )
+                  r = OrderDelete( OrderTicket() );
+               totalBuyStop++;
+            break;
+            case OP_SELLSTOP:
+               if( ( int ) TimeCurrent() - lastSellOrder > VelocityTime && rateChange > -VelocityTrigger * Point * deleteRatio )
+                  r = OrderDelete( OrderTicket() );
+               totalSellStop++;
+            break;
+            case OP_BUY:    
+               if( Bid - OrderOpenPrice() + commissionPoints > Trailing * Point ){  
+                  if( OrderStopLoss() == 0.0 || Bid - OrderStopLoss() > Trailing * Point )
+                     if( NormalizeDouble( Bid - ( Trailing * Point ), Digits ) != OrderStopLoss() )
+                        r = OrderModify( OrderTicket(), OrderOpenPrice(), NormalizeDouble( Bid - ( Trailing * Point ), Digits ), OrderTakeProfit(), 0 );                  
+               } else {
+                  if( AccountEquity() > max || AccountEquity() / AccountBalance() < ( double ) MaxDrawdown / 100 ){
+                     if( rateChange < -VelocityStop * Point && Bid < OrderOpenPrice() - ( VelocityTrigger * Point ) )
+                        if( OrderStopLoss() == 0.0 || Bid - OrderStopLoss() > ( Trailing * Point * TrailingLoss ) )
+                           if( NormalizeDouble( Bid - ( Trailing * Point * TrailingLoss ), Digits ) != OrderStopLoss() )
+                              r = OrderModify( OrderTicket(), OrderOpenPrice(), NormalizeDouble( Bid - ( Trailing * Point * TrailingLoss ), Digits ), OrderTakeProfit(), 0 ); 
+                  }
+               } 
+            break;
+            case OP_SELL:    
+               if( OrderOpenPrice() - commissionPoints - Ask > Trailing * Point ){  
+                  if( OrderStopLoss() == 0.0 || OrderStopLoss() - Ask > Trailing * Point ) 
+                     if( NormalizeDouble( Ask + ( Trailing * Point ), Digits ) != OrderStopLoss() )
+                        r = OrderModify(OrderTicket(), OrderOpenPrice(), NormalizeDouble( Ask + ( Trailing * Point ), Digits ), OrderTakeProfit(), 0 );                    
+               } else {
+                  if( AccountEquity() > max || AccountEquity() / AccountBalance() < ( double ) MaxDrawdown / 100 ){
+                     if( rateChange > VelocityStop * Point  && Ask > OrderOpenPrice() + ( VelocityTrigger * Point ) )
+                        if( OrderStopLoss() == 0.0 || OrderStopLoss() - Ask > ( Trailing * Point * TrailingLoss ) ) 
+                           if( NormalizeDouble( Ask + ( Trailing * Point * TrailingLoss ), Digits ) != OrderStopLoss() )
+                              r = OrderModify(OrderTicket(), OrderOpenPrice(), NormalizeDouble( Ask + ( Trailing * Point * TrailingLoss ), Digits ), OrderTakeProfit(), 0 );
+                  }
+               } 
+            break;
+         }  
+      }
+   }  
+   
+   if( totalTrades == 0 )
+      if( AccountBalance() > max ) max = AccountBalance(); 
+    
+   if( TradeManager == 0 && totalTrades < TradeDeviation && IsTradingTime() ) { 
+
+   // === Condición alcista: coloca BuyStop Y SellStop ===
+   if( slowSize / Point > 70 && fastSize / Point < 50 && rateChange > VelocityTrigger * Point && avgSpread <= maxSpread ) { 
+      
+      // BuyStop original
+      if( totalBuyStop < TradeDeviation ) {
+         double entryPrice = Ask + ( totalBuyStop + 1.0 ) * ( Point * TradeDelta );
+         double slPrice    = NormalizeDouble( entryPrice - ( Stoploss * Point ), Digits );
+         ticket = OrderSend( Symbol(), OP_BUYSTOP, lotSize(), entryPrice, Slippage, slPrice, 0, TradeComment, MagicNumber, 0 );
+         lastBuyOrder = ( int ) TimeCurrent();
+      }
+      
+      // SellStop complementario (misma condición, se coloca a la baja)
+      if( totalSellStop < TradeDeviation ) {
+         double entryPrice = Bid - ( totalSellStop + 1.0 ) * ( Point * TradeDelta );
+         double slPrice    = NormalizeDouble( entryPrice + ( Stoploss * Point ), Digits );
+         ticket = OrderSend( Symbol(), OP_SELLSTOP, lotSize(), entryPrice, Slippage, slPrice, 0, TradeComment, MagicNumber, 0 );
+         lastSellOrder = ( int ) TimeCurrent();
+      }
+   } 
+   
+   // === Condición bajista: coloca SellStop Y BuyStop ===
+   if( slowSize / Point > 70 && fastSize / Point < 50 && rateChange < -VelocityTrigger * Point && avgSpread <= maxSpread ) { 
+      
+      // SellStop original
+      if( totalSellStop < TradeDeviation ) {
+         double entryPrice = Bid - ( totalSellStop + 1.0 ) * ( Point * TradeDelta );
+         double slPrice    = NormalizeDouble( entryPrice + ( Stoploss * Point ), Digits );
+         ticket = OrderSend( Symbol(), OP_SELLSTOP, lotSize(), entryPrice, Slippage, slPrice, 0, TradeComment, MagicNumber, 0 );
+         lastSellOrder = ( int ) TimeCurrent();
+      }
+      
+      // BuyStop complementario (misma condición, se coloca al alza)
+      if( totalBuyStop < TradeDeviation ) {
+         double entryPrice = Ask + ( totalBuyStop + 1.0 ) * ( Point * TradeDelta );
+         double slPrice    = NormalizeDouble( entryPrice - ( Stoploss * Point ), Digits );
+         ticket = OrderSend( Symbol(), OP_BUYSTOP, lotSize(), entryPrice, Slippage, slPrice, 0, TradeComment, MagicNumber, 0 );
+         lastBuyOrder = ( int ) TimeCurrent();
+      }
+   }  
+}
+    
+   display(); 
+   return ( 0 );
+} 
+
+double lotSize(){  
+   if( FixedLot > 0 ){
+      lotSize = NormalizeDouble( FixedLot, 2 );
+   } else {
+      if( marginRequirement > 0 ) 
+         lotSize = MathMax( MathMin( NormalizeDouble( ( AccountBalance() * ( ( double ) RiskPercent / 1000 ) * 0.01 / marginRequirement ), 2 ), maxLot ), minLot );    
+   }  
+   return ( NormalizeLots( lotSize ) ); 
+}  
+
+double NormalizeLots( double p ){
+    double ls = MarketInfo( Symbol(), MODE_LOTSTEP );
+    return( MathRound( p / ls ) * ls );
+}
+
+void prepareSpread(){
+   if( !IsTesting() ){  
+      double spreadSize_temp[];
+      ArrayResize( spreadSize_temp, size - 1 );
+      ArrayCopy( spreadSize_temp, spreadSize, 0, 1, size - 1 );
+      ArrayResize( spreadSize_temp, size ); 
+      spreadSize_temp[size-1] = NormalizeDouble( Ask - Bid, Digits ); 
+      ArrayCopy( spreadSize, spreadSize_temp, 0, 0 ); 
+      avgSpread = iMAOnArray( spreadSize, size, size, 0, MODE_LWMA, 0 );  
+   }
+}       
+
+void manageTicks(){    
+   double tick_temp[], tickTime_temp[], avgtick_temp[];
+   ArrayResize( tick_temp, size - 1 );
+   ArrayResize( tickTime_temp, size - 1 );
+   ArrayCopy( tick_temp, tick, 0, 1, size - 1 ); 
+   ArrayCopy( tickTime_temp, tickTime, 0, 1, size - 1 ); 
+   ArrayResize( tick_temp, size ); 
+   ArrayResize( tickTime_temp, size );
+   tick_temp[size-1] = Bid;
+   tickTime_temp[size-1] = ( int ) TimeCurrent();
+   ArrayCopy( tick, tick_temp, 0, 0 );    
+   ArrayCopy( tickTime, tickTime_temp, 0, 0 ); 
+   int timeNow = tickTime[size-1];
+   double priceNow = tick[size-1];
+   double priceThen = 0;   
+   int period = 0;
+   for( int i = size - 1; i >= 0; i-- ){ 
+      period++;
+      if( timeNow - tickTime[i] > VelocityTime ){
+         priceThen = tick[i]; 
+         break;
+      }  
+   }     
+    
+   rateChange = ( priceNow - priceThen );
+   if( rateChange / Point > 5000 ) rateChange = 0;     
+} 
+
+
+void manageTicks2(){     
+
+   double tickBidFast_temp[], tickTimeBidFast_temp[];
+   ArrayResize( tickBidFast_temp, sizeFast - 1 );
+   ArrayResize( tickTimeBidFast_temp, sizeFast - 1 );
+   ArrayCopy( tickBidFast_temp, tickBidFast, 0, 1, sizeFast - 1 ); 
+   ArrayCopy( tickTimeBidFast_temp, tickTimeBidFast, 0, 1, sizeFast - 1 ); 
+   ArrayResize( tickBidFast_temp, sizeFast ); 
+   ArrayResize( tickTimeBidFast_temp, sizeFast );
+   tickBidFast_temp[sizeFast-1] = Bid;
+   tickTimeBidFast_temp[sizeFast-1] = ( int ) TimeCurrent();
+   ArrayCopy( tickBidFast, tickBidFast_temp, 0, 0 );    
+   ArrayCopy( tickTimeBidFast, tickTimeBidFast_temp, 0, 0 );   
+   
+   double tickAskFast_temp[], tickTimeAskFast_temp[];
+   ArrayResize( tickAskFast_temp, sizeFast - 1 );
+   ArrayResize( tickTimeAskFast_temp, sizeFast - 1 );
+   ArrayCopy( tickAskFast_temp, tickAskFast, 0, 1, sizeFast - 1 ); 
+   ArrayCopy( tickTimeAskFast_temp, tickTimeAskFast, 0, 1, sizeFast - 1 ); 
+   ArrayResize( tickAskFast_temp, sizeFast ); 
+   ArrayResize( tickTimeAskFast_temp, sizeFast );
+   tickAskFast_temp[sizeFast-1] = Ask;
+   tickTimeAskFast_temp[sizeFast-1] = ( int ) TimeCurrent();
+   ArrayCopy( tickAskFast, tickAskFast_temp, 0, 0 );    
+   ArrayCopy( tickTimeAskFast, tickTimeAskFast_temp, 0, 0 );   
+   
+   double tickBidSlow_temp[], tickTimeBidSlow_temp[];
+   ArrayResize( tickBidSlow_temp, sizeSlow - 1 );
+   ArrayResize( tickTimeBidSlow_temp, sizeSlow - 1 );
+   ArrayCopy( tickBidSlow_temp, tickBidSlow, 0, 1, sizeSlow - 1 ); 
+   ArrayCopy( tickTimeBidSlow_temp, tickTimeBidSlow, 0, 1, sizeSlow - 1 ); 
+   ArrayResize( tickBidSlow_temp, sizeSlow ); 
+   ArrayResize( tickTimeBidSlow_temp, sizeSlow );
+   tickBidSlow_temp[sizeSlow-1] = Bid;
+   tickTimeBidSlow_temp[sizeSlow-1] = ( int ) TimeCurrent();
+   ArrayCopy( tickBidSlow, tickBidSlow_temp, 0, 0 );    
+   ArrayCopy( tickTimeBidSlow, tickTimeBidSlow_temp, 0, 0 );   
+   
+   double tickAskSlow_temp[], tickTimeAskSlow_temp[];
+   ArrayResize( tickAskSlow_temp, sizeSlow - 1 );
+   ArrayResize( tickTimeAskSlow_temp, sizeSlow - 1 );
+   ArrayCopy( tickAskSlow_temp, tickAskSlow, 0, 1, sizeSlow - 1 ); 
+   ArrayCopy( tickTimeAskSlow_temp, tickTimeAskSlow, 0, 1, sizeSlow - 1 ); 
+   ArrayResize( tickAskSlow_temp, sizeSlow ); 
+   ArrayResize( tickTimeAskSlow_temp, sizeSlow );
+   tickAskSlow_temp[sizeSlow-1] = Ask;
+   tickTimeAskSlow_temp[sizeSlow-1] = ( int ) TimeCurrent();
+   ArrayCopy( tickAskSlow, tickAskSlow_temp, 0, 0 );    
+   ArrayCopy( tickTimeAskSlow, tickTimeAskSlow_temp, 0, 0 );  
+    
+   maxValueIdx = ArrayMaximum( tickAskFast, WHOLE_ARRAY, 0 ); 
+   minValueIdx = ArrayMinimum( tickBidFast, WHOLE_ARRAY, 0 );
+   ObjectSet( "max", OBJPROP_PRICE1, NormalizeDouble( tickAskFast[maxValueIdx], Digits ) );
+   ObjectSet( "min", OBJPROP_PRICE1, NormalizeDouble( tickBidFast[minValueIdx], Digits ) ); 
+
+   maxValueIdxSlow = ArrayMaximum( tickAskSlow, WHOLE_ARRAY, 0 ); 
+   minValueIdxSlow = ArrayMinimum( tickBidSlow, WHOLE_ARRAY, 0 );
+   ObjectSet( "maxSlow", OBJPROP_PRICE1, NormalizeDouble( tickAskSlow[maxValueIdxSlow], Digits ) );
+   ObjectSet( "minSlow", OBJPROP_PRICE1, NormalizeDouble( tickBidSlow[minValueIdxSlow], Digits ) );
+    
+   fastSize = MathAbs( tickAskFast[maxValueIdx] - tickBidFast[minValueIdx] );
+   slowSize = MathAbs( tickAskSlow[maxValueIdxSlow] - tickBidSlow[minValueIdxSlow] );
+   
+   avgFast = ( tickAskFast[maxValueIdx] + tickBidFast[minValueIdx] ) / 2;
+   avgSlow = ( tickAskSlow[maxValueIdxSlow] + tickBidSlow[minValueIdxSlow] ) / 2;
+   
+   if( slowSize > 0 )
+      volatilityRatio = fastSize / slowSize; 
+      
+   directionRatio = ( avgFast  - avgSlow ) / slowSize * 2 ;
+      
+}  
+
+//+------------------------------------------------------------------+
+//| Devuelve true si la hora actual está dentro de la franja operativa|
+//+------------------------------------------------------------------+
+bool IsTradingTime() {
+   // Si GMTOffset = 0, el filtro horario está desactivado
+   if( GMTOffset == 0 ) return( true );
+   
+   // Hora del servidor del bróker + ajuste GMT = hora "real" deseada
+   int currentHour   = Hour()   + GMTOffset;
+   int currentMinute = Minute();
+   
+   // Normalizar la hora si cruza el día
+   if( currentHour >= 24 ) currentHour -= 24;
+   if( currentHour < 0 )   currentHour += 24;
+   
+   // Convertir todo a minutos desde las 00:00 para comparar rangos
+   int currentTimeMin = currentHour * 60 + currentMinute;
+   int startTimeMin   = StartHour * 60 + StartMinute;
+   int endTimeMin     = EndHour   * 60 + EndMinute;
+   
+   // Caso normal: la franja no cruza medianoche (ej. 1:00 → 23:00)
+   if( startTimeMin <= endTimeMin ) {
+      if( currentTimeMin >= startTimeMin && currentTimeMin <= endTimeMin ) return( true );
+   } 
+   // Caso especial: la franja cruza medianoche (ej. 22:00 → 02:00)
+   else {
+      if( currentTimeMin >= startTimeMin || currentTimeMin <= endTimeMin ) return( true );
+   }
+   
+   return( false );
+}
+
+void display(){  
+    //if( !IsTesting() ){ 
+      string display = "  Monkey Pips v3.01\n";
+      display = StringConcatenate( display, " ----------------------------------------\n" );
+      if( TradeManager == 0 )
+         display = StringConcatenate( display, "  TradeManager: Primary\n" );
+      else 
+         display = StringConcatenate( display, "  TradeManager: Secondary\n" ); 
+      display = StringConcatenate( display, " ----------------------------------------\n" );
+      display = StringConcatenate( display, "  Leverage: ", DoubleToStr( AccountLeverage(), 0 ), " Lots: ", DoubleToStr( lotSize, 2 ), ", \n" ); 
+      display = StringConcatenate( display, "  Avg. Spread: ", DoubleToStr( avgSpread / Point, 0 ), " of ", MaxSpread, ", \n" ); 
+      display = StringConcatenate( display, "  Commission: ", DoubleToStr( commissionPoints / Point, 0 ), " \n" ); 
+      display = StringConcatenate( display, " ----------------------------------------\n" );
+      display = StringConcatenate( display, "  Set: ", TradeComment, " \n" ); 
+      display = StringConcatenate( display, " ----------------------------------------\n" ); 
+      
+      display = StringConcatenate( display, "  Slow: ", DoubleToStr( slowSize / Point, 0 ), " \n" );
+      display = StringConcatenate( display, "  Fast: ", DoubleToStr( fastSize / Point, 0 ), " \n" );
+      display = StringConcatenate( display, "  directionRatio: ", DoubleToStr( directionRatio , 2 ), " \n" );
+      display = StringConcatenate( display, "  volatilityRatio: ", DoubleToStr( volatilityRatio , 2 ), " \n" );
+      Comment( display ); 
+  //}
+}
